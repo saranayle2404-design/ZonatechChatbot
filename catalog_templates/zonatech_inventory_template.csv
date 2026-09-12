@@ -1,0 +1,4 @@
+source_id,nombre,categoria,marca,modelo,descripcion,precio,stock,imagen_url,activo
+DEMO-AUD-001,DEMO - Audifonos Bluetooth Zonatech,Audifonos,DEMO,ZT Sound 1,PRODUCTO DEMO - reemplazar por datos reales antes de importar,59900,10,,1
+DEMO-CAB-001,DEMO - Cable USB-C Zonatech,Cables,DEMO,ZT Cable 1,PRODUCTO DEMO - reemplazar por datos reales antes de importar,15000,25,,1
+DEMO-OUT-001,DEMO - Producto descontinuado,Otros accesorios,DEMO,ZT Demo Out,PRODUCTO DEMO - ejemplo de producto inactivo,0,0,,0
