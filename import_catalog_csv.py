@@ -40,7 +40,6 @@ CATEGORY_ALIASES = {
     "computador": "Computadores",
     "computadoras": "Computadores",
     "portatiles": "Computadores",
-    "portatiles": "Computadores",
 
     "audifonos": "Audífonos",
     "audifono": "Audífonos",
@@ -161,8 +160,6 @@ def correct_typos(value):
         )
 
     return text
-
-
 def detect_brand(name, description, current_brand, current_category):
     current_brand = clean_text(current_brand)
 
@@ -194,22 +191,11 @@ def detect_category(name, description, current_category):
     name_key = normalize_key(" ".join((name, description)))
     category_key = normalize_key(current_category)
 
-    # Audífonos / earbuds / diademas.
-    if re.search(
-        r"\b("
-        r"audifono|audifonos|earbud|earbuds|"
-        r"airpods?|buds|diadema|diademas|"
-        r"headphone|headphones|headset|manos libres|"
-        r"cuellera|neck band|air conduction"
-        r")\b",
-        name_key,
-    ):
-        return "Audífonos"
-
-    if "bluetooth" in name_key and not re.search(r"\b(?:car|carro|usb)\b", name_key):
-        return "Audífonos"
-
-    # Celulares.
+    # ============================================================
+    # CELULARES
+    # Prioridad alta: evita que productos como
+    # "REDMI NOTE 15 PRO + BUDS" sean clasificados como Audífonos.
+    # ============================================================
     if re.search(
         r"\b("
         r"iphone|samsung\s+(?:a|s|m)\d+|"
@@ -221,13 +207,50 @@ def detect_category(name, description, current_category):
     ):
         return "Celulares"
 
+    # ============================================================
+    # AUDÍFONOS
+    # ============================================================
+    if re.search(
+        r"\b("
+        r"audifono|audifonos|earbud|earbuds|"
+        r"airpods?|buds|diadema|diademas|"
+        r"headphone|headphones|headset|manos libres|"
+        r"cuellera|neck band|air conduction"
+        r")\b",
+        name_key,
+    ):
+        return "Audífonos"
+
+    if "bluetooth" in name_key and not re.search(
+        r"\b(?:car|carro|usb)\b",
+        name_key,
+    ):
+        return "Audífonos"
+
     # Parlantes.
-    if re.search(r"\b(parlante|parlantes|speaker)\b", name_key):
+    if re.search(
+        r"\b(parlante|parlantes|speaker)\b",
+        name_key,
+    ):
         return "Parlantes"
 
     # Cargadores.
-    if re.search(r"\b(cargador|cargadores|charger|cabeza|car carro)\b", name_key):
+    if re.search(
+        r"\b(cargador|cargadores|charger|cabeza|car carro)\b",
+        name_key,
+    ):
         return "Cargadores"
+
+    # ============================================================
+    # MOUSE
+    # Prioridad antes de Cables porque un mouse puede tener
+    # palabras como "cable", "USB" u "optical".
+    # ============================================================
+    if re.search(
+        r"\b(mouse|pad mouse)\b",
+        name_key,
+    ):
+        return "Mouse"
 
     # Cables.
     if re.search(
@@ -237,7 +260,10 @@ def detect_category(name, description, current_category):
         return "Cables"
 
     # Forros / fundas.
-    if re.search(r"\b(forro|forros|funda|fundas|case)\b", name_key):
+    if re.search(
+        r"\b(forro|forros|funda|fundas|case)\b",
+        name_key,
+    ):
         return "Forros"
 
     # Vidrios.
@@ -253,7 +279,7 @@ def detect_category(name, description, current_category):
 
     # Memorias.
     if re.search(
-        r"\b(memoria|memorias|micro\s*sd|micro\s*sd|sd card)\b",
+        r"\b(memoria|memorias|micro\s*sd|sd card)\b",
         name_key,
     ):
         return "Memorias"
@@ -272,26 +298,45 @@ def detect_category(name, description, current_category):
     ):
         return "Adaptadores"
 
-    # Si no podemos determinarla con seguridad,
-    # conservamos la categoría original.
-    if re.search(r"\b(mouse|pad mouse)\b", name_key):
-        return "Mouse"
-
-    if re.search(r"\b(teclado|combo teclado)\b", name_key):
+    # Teclados.
+    if re.search(
+        r"\b(teclado|combo teclado)\b",
+        name_key,
+    ):
         return "Teclados"
 
-    if re.search(r"\b(control|joystick)\b", name_key):
+    # Controles.
+    if re.search(
+        r"\b(control|joystick)\b",
+        name_key,
+    ):
         return "Controles"
 
-    if re.search(r"\b(disco|disco duro)\b", name_key):
+    # Discos.
+    if re.search(
+        r"\b(disco|disco duro)\b",
+        name_key,
+    ):
         return "Discos"
 
-    if re.search(r"\b(laptop|notebook|portatil|macbook|computador|impresora)\b", name_key):
+    # Computadores / accesorios de computador.
+    if re.search(
+        r"\b(laptop|notebook|portatil|macbook|computador|impresora)\b",
+        name_key,
+    ):
         return "Accesorios Computadores"
 
-    if re.search(r"\b(holder|holdel|soporte|stand|tripode|aro luz|palo selfie|camara web|webcam|power bank|power band|multipuerto|hub|usb bluetooth)\b", name_key):
+    # Accesorios.
+    if re.search(
+        r"\b(holder|holdel|soporte|stand|tripode|aro luz|"
+        r"palo selfie|camara web|webcam|power bank|power band|"
+        r"multipuerto|hub|usb bluetooth)\b",
+        name_key,
+    ):
         return "Accesorios"
 
+    # Si no podemos determinarla con seguridad,
+    # usamos la categoría original.
     if category_key in CATEGORY_ALIASES:
         return CATEGORY_ALIASES[category_key]
 
@@ -481,6 +526,49 @@ def import_csv(path, deactivate_missing=False):
 
     with get_connection() as connection:
 
+        # ========================================================
+        # PROTECCIÓN DE --deactivate-missing
+        #
+        # Se valida ANTES de cualquier UPSERT.
+        # Si el CSV está incompleto, no se modifica ningún
+        # producto de la base de datos.
+        # ========================================================
+        if deactivate_missing:
+
+            if not seen_ids:
+                raise ValueError(
+                    "No se puede desactivar productos con un CSV vacío."
+                )
+
+            active_rows = connection.execute(
+                """
+                SELECT source_id
+                FROM productos
+                WHERE activo=1
+                AND source_id IS NOT NULL
+                """
+            ).fetchall()
+
+            active_source_ids = {
+                row["source_id"]
+                for row in active_rows
+            }
+
+            missing_active_ids = active_source_ids - seen_ids
+
+            if missing_active_ids:
+                sample = sorted(missing_active_ids)[:10]
+
+                raise ValueError(
+                    "CSV incompleto: faltan "
+                    f"{len(missing_active_ids)} source_id activos. "
+                    "No se desactivó ningún producto. "
+                    f"Ejemplos: {', '.join(sample)}"
+                )
+
+        # ========================================================
+        # UPSERT DEL CATÁLOGO
+        # ========================================================
         for row in normalized_rows:
 
             connection.execute(
@@ -524,12 +612,10 @@ def import_csv(path, deactivate_missing=False):
                 row,
             )
 
+        # ========================================================
+        # DESACTIVAR SOLO SI EL CSV ESTÁ COMPLETO
+        # ========================================================
         if deactivate_missing:
-
-            if not seen_ids:
-                raise ValueError(
-                    "No se puede desactivar productos con un CSV vacío."
-                )
 
             placeholders = ",".join(
                 "?" for _ in seen_ids
