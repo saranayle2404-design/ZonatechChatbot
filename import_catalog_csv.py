@@ -191,19 +191,34 @@ def detect_category(name, description, current_category):
     name_key = normalize_key(" ".join((name, description)))
     category_key = normalize_key(current_category)
 
+    # Parlantes deben prevalecer sobre la regla generica de Bluetooth.
+    if re.search(
+        r"\b(parlante|parlantes|speaker|speakers|altavoz|altavoces)\b",
+        name_key,
+    ):
+        return "Parlantes"
+
     # ============================================================
     # CELULARES
     # Prioridad alta: evita que productos como
     # "REDMI NOTE 15 PRO + BUDS" sean clasificados como Audífonos.
     # ============================================================
-    if re.search(
+    if (
+        not re.search(
+            r"\b(cable|cables|lightning|usb[- ]?c|type[- ]?c|vga|hdmi|"
+            r"cargador|cargadores|charger|cabeza|forro|forros|funda|fundas|"
+            r"case|vidrio|vidrios|templado|protector|hidrogel)\b",
+            name_key,
+        )
+        and re.search(
         r"\b("
-        r"iphone|samsung\s+(?:a|s|m)\d+|"
-        r"galaxy|redmi\s+(?:note|\d)|"
+        r"iphone\s+(?:\d+|se\b)|samsung\s+(?:a|s|m)\d+|"
+        r"galaxy\s+(?:a|s|m|z)\d+|redmi\s+(?:note|\d)|"
         r"motorola|moto\s+(?:g|e|edge)|huawei\s+\w+|"
         r"tecno\s+\w+|vivo\s+\w+|oppo\s+\w+|realme\s+\w+"
         r")\b",
         name_key,
+        )
     ):
         return "Celulares"
 
@@ -213,7 +228,7 @@ def detect_category(name, description, current_category):
     if re.search(
         r"\b("
         r"audifono|audifonos|earbud|earbuds|"
-        r"airpods?|buds|diadema|diademas|"
+        r"airpods?|buds\d*|diadema|diademas|"
         r"headphone|headphones|headset|manos libres|"
         r"cuellera|neck band|air conduction"
         r")\b",

@@ -590,8 +590,18 @@ def product_card(product):
 
 
 def show_products(session, query="", category=None, max_price=None, available_only=False, page=1, brand=None):
+    filters = {
+        "query": query,
+        "category": category,
+        "max_price": max_price,
+        "available_only": available_only,
+        "brand": brand,
+    }
+    previous = session.get("last_search", {})
+    if previous and any(previous.get(key) != value for key, value in filters.items()):
+        session.pop("pending_result_purchase", None)
     products, total = search_products(query, category, max_price, available_only, page, PAGE_SIZE, brand)
-    session["last_search"] = {"query": query, "category": category, "max_price": max_price, "available_only": available_only, "page": page, "brand": brand}
+    session["last_search"] = {**filters, "page": page}
     session["last_results"] = [product["id"] for product in products]
     if not total:
         if max_price is not None:
@@ -680,8 +690,9 @@ def payment_methods_for_cart(cart):
 def purchase_flow(session, message, text):
     flow = session["flow"]
     if "cancelar" in text:
-        session["flow"], session["data"] = None, {}
-        return response("Compra cancelada. Tu carrito no fue modificado.", ["Ver catálogo"])
+        session["cart"], session["flow"], session["data"] = [], None, {}
+        session.pop("pending_result_purchase", None)
+        return response("Compra cancelada. El carrito fue limpiado.", ["Ver catálogo"])
     if flow == "quantity":
         if not text.isdigit() or int(text) < 1:
             return response("Indica una cantidad válida, por ejemplo: 1.")
