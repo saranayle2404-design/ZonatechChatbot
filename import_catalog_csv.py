@@ -191,6 +191,11 @@ def detect_category(name, description, current_category):
     name_key = normalize_key(" ".join((name, description)))
     category_key = normalize_key(current_category)
 
+    # Un Redmi Note con modelo sigue siendo un celular aunque incluya
+    # accesorios promocionales, como +BUDS o +PARLANTE.
+    if re.search(r"\bredmi\s+note\s+\d+\b", name_key):
+        return "Celulares"
+
     # Parlantes deben prevalecer sobre la regla generica de Bluetooth.
     if re.search(
         r"\b(parlante|parlantes|speaker|speakers|altavoz|altavoces)\b",
@@ -485,7 +490,7 @@ def backup_database():
     if not database_path.exists():
         return None
 
-    backup_path = Path("database") / "zonatech_before_normalization_v2.db"
+    backup_path = Path("database") / "zonatech_before_catalog_import_normalization_20260913.db"
     shutil.copy2(database_path, backup_path)
 
     return backup_path
