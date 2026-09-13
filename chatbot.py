@@ -313,7 +313,7 @@ def recommend_from_context(session):
     if options:
         products, total = search_products(
             options.get("query", ""), options.get("category"), options.get("max_price"),
-            options.get("available_only", False), 1, PAGE_SIZE,
+            options.get("available_only", False), 1, PAGE_SIZE, options.get("brand"),
         )
         if total and products:
             available = [product for product in products if product["stock"] > 0 and product["precio"] is not None]
@@ -328,7 +328,7 @@ def recommend_from_context(session):
     if conversation.get("category") or conversation.get("query"):
         return show_products(
             session, conversation.get("query", ""), conversation.get("category"),
-            conversation.get("budget"), True,
+            conversation.get("budget"), True, brand=conversation.get("brand"),
         )
     return response("Para recomendarte una opción real, dime qué producto buscas o un presupuesto aproximado.", ["Ver catálogo", "Hablar con un asesor"])
 
@@ -359,7 +359,7 @@ def result_conversation(session, text):
     if relative_price:
         items, _ = search_products(
             options.get("query", ""), options.get("category"), options.get("max_price"),
-            options.get("available_only", False), 1, 1000,
+            options.get("available_only", False), 1, 1000, options.get("brand"),
         )
         shown_products = [get_product(product_id) for product_id in session.get("last_results", [])]
         shown_prices = [product["precio"] for product in shown_products if product and product["precio"] is not None]
@@ -395,7 +395,7 @@ def result_conversation(session, text):
     if re.search(r"\b(?:otro|uno) mas barato\b", text) or re.search(r"\b(?:otro|uno) mas caro\b", text):
         items, _ = search_products(
             options.get("query", ""), options.get("category"), options.get("max_price"),
-            options.get("available_only", False), 1, 1000,
+            options.get("available_only", False), 1, 1000, options.get("brand"),
         )
         shown = set(session.get("last_results", []))
         candidates = [product for product in items if product["id"] not in shown and product["precio"] is not None]
@@ -421,14 +421,14 @@ def start_discovery(session, text):
         budget = conversation.get("budget")
     category = interest if interest in {row["categoria"] for row in list_categories()} else None
     brand, brand_label = brand_for_text(text)
-    query = brand or ""
+    query = ""
     conversation.update({"interest": interest, "category": category, "query": query, "budget": budget, "stage": "budget"})
     if brand:
         conversation["brand"] = brand_label
         if category and not brand_is_active(brand, category):
             return response(f"No encontré productos {brand_label} activos en el catálogo actual.", ["Ver CELULARES", "Ver catálogo", "Hablar con un asesor"])
         if category:
-            return show_products(session, query=brand, category=category, max_price=budget, available_only=False)
+            return show_products(session, query=query, category=category, max_price=budget, available_only=False, brand=brand_label)
     if category == "CELULARES":
         if budget is None:
             return response("¡Claro! 📱 Te ayudo a encontrar uno. ¿Tienes un presupuesto aproximado o buscas algo en especial?", ["Ver CELULARES", "Hablar con un asesor"])
@@ -502,13 +502,13 @@ def conversational_search(session, message, text):
     brand, brand_label = brand_for_text(text)
     if brand and conversation.get("category"):
         conversation["brand"] = brand_label
-        conversation["query"] = brand
+        conversation["query"] = ""
         conversation["stage"] = "brand"
         category = conversation["category"]
         if not brand_is_active(brand, category):
             return response(f"No encontré productos {brand_label} activos en el catálogo actual.", ["Ver CELULARES", "Ver catálogo", "Hablar con un asesor"])
         return show_products(
-            session, brand, category, conversation.get("budget"), True,
+            session, "", category, conversation.get("budget"), True, brand=brand_label,
         )
     if conversation.get("category") and re.search(r"\b(?:unos?|algo|tienes) mas (?:barato|economico)\b", text):
         conversation["price_preference"] = "economico"
@@ -666,6 +666,16 @@ def parse_search(text):
     query = " ".join(word for word in re.findall(r"[a-z0-9]+", query) if not word.isdigit())
     query = re.sub(r"\badaptadores\b", "adaptador", query)
     return query, category, max_price
+
+
+def parse_catalog_search(text):
+    """Separates an active catalog brand from the free-text product query."""
+    query, category, max_price = parse_search(text)
+    brand_key, brand = brand_for_text(text)
+    if brand_key:
+        query = re.sub(rf"(?<!\w){re.escape(brand_key)}(?!\w)", " ", query)
+        query = " ".join(query.split())
+    return query, category, max_price, brand
 
 
 def start_purchase(session, product_id):
@@ -992,15 +1002,15 @@ def process_message(message, session_id="default"):
     if re.search(r"catalogo|que (?:tienen|venden)|ver todo|ver audifonos|ver adaptadores", text):
         if text in {"catalogo", "ver catalogo", "muestrame el catalogo", "quiero ver el catalogo", "que tienen disponible", "que productos venden"}:
             return catalog_menu()
-        query, category, max_price = parse_search(text)
-        return show_products(session, query, category, max_price, "disponible" in text)
+        query, category, max_price, brand = parse_catalog_search(text)
+        return show_products(session, query, category, max_price, "disponible" in text, brand=brand)
     if "comprar" in text:
-        query, category, max_price = parse_search(text)
-        products, total = search_products(query, category, max_price, True, 1, PAGE_SIZE)
+        query, category, max_price, brand = parse_catalog_search(text)
+        products, total = search_products(query, category, max_price, True, 1, PAGE_SIZE, brand)
         if total == 1:
             return start_purchase(session, products[0]["id"])
-        return show_products(session, query, category, max_price, True)
-    query, category, max_price = parse_search(text)
+        return show_products(session, query, category, max_price, True, brand=brand)
+    query, category, max_price, brand = parse_catalog_search(text)
     available_only = bool(re.search(r"\bdisponibles?\b", text))
     catalog_intent = (
         category is not None
@@ -1010,7 +1020,7 @@ def process_message(message, session_id="default"):
         or bool(re.search(r"\b(?:audifonos?|adaptadores?|iphone)\b", text))
     )
     if catalog_intent:
-        return show_products(session, query, category, max_price, available_only)
+        return show_products(session, query, category, max_price, available_only, brand=brand)
     if uncertain:
         return response("No estoy seguro de qué quisiste decir 😅 ¿Puedes escribirlo de nuevo o decirme qué producto o marca buscas?", ["Ver catálogo", "Hablar con un asesor"])
     if any(word in text for word in ["domicilio", "envio", "transportadora"]):
