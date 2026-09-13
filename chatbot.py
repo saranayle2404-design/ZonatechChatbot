@@ -172,7 +172,7 @@ def last_search_total(session):
         return 0
     _, total = search_products(
         options.get("query", ""), options.get("category"), options.get("max_price"),
-        options.get("available_only", False), 1, PAGE_SIZE,
+        options.get("available_only", False), 1, PAGE_SIZE, options.get("brand"),
     )
     return total
 
@@ -279,7 +279,7 @@ def brand_for_text(text):
 
 
 def brand_is_active(brand, category="CELULARES"):
-    _, total = search_products(brand, category, None, False, 1, 1)
+    _, total = search_products("", category, None, False, 1, 1, brand)
     return total > 0
 
 
@@ -293,7 +293,7 @@ def redmi_buds_search(session, text):
     if not category or not brand:
         return None
     conversation_for(session).update({"interest": category, "category": category, "brand": brand, "query": "buds", "stage": "brand"})
-    return show_products(session, query="buds", category=category)
+    return show_products(session, query="buds", category=category, brand=brand)
 
 
 def repair_intent(text):
@@ -589,13 +589,13 @@ def product_card(product):
     )
 
 
-def show_products(session, query="", category=None, max_price=None, available_only=False, page=1):
-    products, total = search_products(query, category, max_price, available_only, page, PAGE_SIZE)
-    session["last_search"] = {"query": query, "category": category, "max_price": max_price, "available_only": available_only, "page": page}
+def show_products(session, query="", category=None, max_price=None, available_only=False, page=1, brand=None):
+    products, total = search_products(query, category, max_price, available_only, page, PAGE_SIZE, brand)
+    session["last_search"] = {"query": query, "category": category, "max_price": max_price, "available_only": available_only, "page": page, "brand": brand}
     session["last_results"] = [product["id"] for product in products]
     if not total:
         if max_price is not None:
-            unfiltered, unfiltered_total = search_products(query, category, None, available_only, 1, 1000)
+            unfiltered, unfiltered_total = search_products(query, category, None, available_only, 1, 1000, brand)
             over_budget = [product for product in unfiltered if product["precio"] is not None and product["precio"] > max_price]
             if unfiltered_total and over_budget:
                 _, brand_label = brand_for_text(query)

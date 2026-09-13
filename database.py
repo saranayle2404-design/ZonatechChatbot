@@ -58,10 +58,12 @@ def list_categories():
         return connection.execute("SELECT categoria,COUNT(*) AS total FROM productos WHERE activo=1 GROUP BY categoria ORDER BY categoria").fetchall()
 
 
-def search_products(query="", category=None, max_price=None, available_only=False, page=1, page_size=5):
+def search_products(query="", category=None, max_price=None, available_only=False, page=1, page_size=5, brand=None):
     clauses, values = ["activo=1"], []
     if category:
         clauses.append("LOWER(categoria)=LOWER(?)"); values.append(category)
+    if brand:
+        clauses.append("LOWER(marca)=LOWER(?)"); values.append(brand)
     for word in [word for word in query.lower().split() if len(word) > 1]:
         clauses.append("(LOWER(nombre) LIKE ? OR LOWER(marca) LIKE ? OR LOWER(modelo) LIKE ? OR LOWER(descripcion) LIKE ?)")
         values.extend([f"%{word}%"] * 4)
