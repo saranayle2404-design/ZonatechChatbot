@@ -1,5 +1,6 @@
 import math
 import re
+import sqlite3
 import unicodedata
 
 from database import (
@@ -53,15 +54,6 @@ SAFE_TYPO_CORRECTIONS = {
     "alamecenamiento": "almacenamiento",
     "tecnho": "tecno",
 }
-
-PHONE_BRANDS = {
-    "samsung": "Samsung",
-    "xiaomi": "Xiaomi",
-    "motorola": "Motorola",
-    "iphone": "iPhone",
-    "tecno": "Tecno",
-}
-
 
 def edit_distance(left, right):
     """Small deterministic Levenshtein implementation for short input tokens."""
@@ -143,6 +135,8 @@ def category_for_text(text):
             return actual
     if re.search(r"(?<!\w)(?:celular|telefono|telefonos)(?!\w)", text):
         return categories.get("celulares")
+    if re.search(r"(?<!\w)smart\s*watch(?!\w)", text):
+        return categories.get("smartwatch")
     return None
 
 
@@ -183,6 +177,42 @@ def last_search_total(session):
     return total
 
 
+def last_result_products(session):
+    return [product for product_id in session.get("last_results", []) if (product := get_product(product_id))]
+
+
+def products_list_response(products, heading):
+    if not products:
+        return response("No hay productos disponibles dentro de los últimos resultados mostrados.", ["Ver catálogo"])
+    lines = [heading]
+    for index, product in enumerate(products, 1):
+        availability = "Disponible" if product["stock"] > 0 else "Agotado"
+        lines.append(f"{index}. {product['nombre']} — {money(product['precio'])} · {availability}")
+    return response("\n".join(lines), [f"Ver producto #{product['id']}" for product in products] + ["Ver catálogo"])
+
+
+def last_results_follow_up(session, text):
+    """Answers price and availability questions from the products already shown."""
+    products = last_result_products(session)
+    if not products:
+        return None
+    if re.search(r"\b(?:cuanto cuestan|cuanto vale|que precio tienen|precios?)\b", text):
+        return products_list_response(products, "Estos son los precios de los productos mostrados:")
+    if re.search(r"\b(?:cual es el mas barato|cual cuesta menos|el mas economico)\b", text):
+        priced = [product for product in products if product["precio"] is not None]
+        if not priced:
+            return response("Los productos mostrados no tienen precio registrado.", ["Hablar con un asesor"])
+        product = min(priced, key=lambda item: item["precio"])
+        session["last_selected_id"] = product["id"]
+        return product_card(product)
+    if re.search(r"\b(?:cual esta disponible|cuales estan disponibles|muestrame (?:los )?disponibles|ver disponibles)\b", text):
+        return products_list_response(
+            [product for product in products if product["stock"] > 0],
+            "Estos son los productos disponibles de los últimos resultados:",
+        )
+    return None
+
+
 def specific_product_tokens(text):
     stop_words = {
         "tienes", "tiene", "quiero", "me", "interesa", "el", "la", "los", "las", "un", "una",
@@ -200,7 +230,14 @@ def specific_product_response(session, text):
     """Resolves a clearly named product before falling back to word-by-word catalog search."""
     tokens = specific_product_tokens(text)
     demonstrative = bool(re.search(r"\b(?:ese|esa)\b", text))
-    specific = demonstrative or len(tokens) >= 2 or any(re.search(r"\d", token) for token in tokens)
+    category_words = {
+        word
+        for row in list_categories()
+        for word in normalize(row["categoria"]).split()
+    }
+    brand_words = set(active_brands())
+    distinctive = [word for word in tokens if word not in category_words and word not in brand_words]
+    specific = demonstrative or any(re.search(r"\d", token) for token in tokens) or len(distinctive) >= 2
     if not tokens or not specific:
         return None
 
@@ -224,8 +261,18 @@ def specific_product_response(session, text):
     return None
 
 
+def active_brands():
+    """Returns only brands that exist on active catalog products."""
+    products, _ = search_products("", page=1, page_size=1000)
+    return {
+        normalize(product["marca"]): product["marca"]
+        for product in products
+        if product["marca"] and normalize(product["marca"])
+    }
+
+
 def brand_for_text(text):
-    for key, label in PHONE_BRANDS.items():
+    for key, label in sorted(active_brands().items(), key=lambda item: len(item[0]), reverse=True):
         if re.search(rf"(?<!\w){re.escape(key)}(?!\w)", text):
             return key, label
     return None, None
@@ -234,6 +281,19 @@ def brand_for_text(text):
 def brand_is_active(brand, category="CELULARES"):
     _, total = search_products(brand, category, None, False, 1, 1)
     return total > 0
+
+
+def redmi_buds_search(session, text):
+    """Treats Redmi Buds as a brand/model phrase, never as a SQLite category."""
+    if not re.search(r"\bredmi\s+buds?\b", text):
+        return None
+    categories = {normalize(row["categoria"]): row["categoria"] for row in list_categories()}
+    category = categories.get("audifonos")
+    brand = active_brands().get("redmi")
+    if not category or not brand:
+        return None
+    conversation_for(session).update({"interest": category, "category": category, "brand": brand, "query": "buds", "stage": "brand"})
+    return show_products(session, query="buds", category=category)
 
 
 def repair_intent(text):
@@ -350,8 +410,6 @@ def result_conversation(session, text):
 
 
 def product_interest(text):
-    if re.search(r"\b(?:audifonos?|adaptadores?|parlante|smart\s*watch)\b", text):
-        return "audifonos" if "audifono" in text else text
     return category_for_text(text)
 
 
@@ -363,21 +421,23 @@ def start_discovery(session, text):
         budget = conversation.get("budget")
     category = interest if interest in {row["categoria"] for row in list_categories()} else None
     brand, brand_label = brand_for_text(text)
-    query = brand or ("audifonos" if interest == "audifonos" else "")
+    query = brand or ""
     conversation.update({"interest": interest, "category": category, "query": query, "budget": budget, "stage": "budget"})
     if brand:
         conversation["brand"] = brand_label
-        if category == "CELULARES" and not brand_is_active(brand, category):
+        if category and not brand_is_active(brand, category):
             return response(f"No encontré productos {brand_label} activos en el catálogo actual.", ["Ver CELULARES", "Ver catálogo", "Hablar con un asesor"])
+        if category:
+            return show_products(session, query=brand, category=category, max_price=budget, available_only=False)
     if category == "CELULARES":
         if budget is None:
             return response("¡Claro! 📱 Te ayudo a encontrar uno. ¿Tienes un presupuesto aproximado o buscas algo en especial?", ["Ver CELULARES", "Hablar con un asesor"])
         conversation["stage"] = "preference"
         return response("Perfecto 👌 ¿Qué te importa más: cámara, batería, rendimiento o almacenamiento?")
-    if interest == "audifonos":
+    if category == "Audífonos":
         if budget is None:
             return response("¡Claro! 🎧 ¿Los buscas para música, llamadas, gaming o uso diario? Si tienes un presupuesto, también me sirve.")
-        return show_products(session, query=query, category=None, max_price=budget, available_only=True)
+        return show_products(session, query=query, category=category, max_price=budget, available_only=True)
     return None
 
 
@@ -440,14 +500,15 @@ def conversational_search(session, message, text):
         conversation["stage"] = "budget"
         return response("Perfecto 🎧 ¿Tienes un presupuesto máximo?")
     brand, brand_label = brand_for_text(text)
-    if brand and conversation.get("category") == "CELULARES":
+    if brand and conversation.get("category"):
         conversation["brand"] = brand_label
         conversation["query"] = brand
         conversation["stage"] = "brand"
-        if not brand_is_active(brand, "CELULARES"):
+        category = conversation["category"]
+        if not brand_is_active(brand, category):
             return response(f"No encontré productos {brand_label} activos en el catálogo actual.", ["Ver CELULARES", "Ver catálogo", "Hablar con un asesor"])
         return show_products(
-            session, brand, "CELULARES", conversation.get("budget"), True,
+            session, brand, category, conversation.get("budget"), True,
         )
     if conversation.get("category") and re.search(r"\b(?:unos?|algo|tienes) mas (?:barato|economico)\b", text):
         conversation["price_preference"] = "economico"
@@ -489,7 +550,7 @@ def payments_and_shipping_info():
     return response(
         "💳 Pagos y envíos\n\n"
         "Métodos de pago: transferencia bancaria, efectivo, tarjetas, Addi y Sistecrédito.\n"
-        "Addi y Sistecrédito aplican únicamente para accesorios.\n\n"
+        "Según la configuración actual, Addi y Sistecrédito aplican únicamente para Audífonos y Adaptadores.\n\n"
         "Hacemos domicilios y envíos nacionales. El costo depende de la transportadora. "
         "Para envíos nacionales, el tiempo estimado es de 2 a 3 días.",
         RETURN_OPTIONS,
@@ -588,11 +649,11 @@ def parse_search(text):
         max_price = value * (1_000_000 if unit.startswith("millon") else (1000 if unit else 1))
         query_text = query_text[:amount.start()] + " " + query_text[amount.end():]
     query = re.sub(
-        r"\b(?:quiero|ver|mostrar|muestra|muestrame|que|tienen|tiene|hay|busco|necesito|dame|cuanto|cuales|disponibles|disponible|todos|las|los|el|la|de|por|menos|hasta|maximo|mil|catalogo|producto|productos|comprar|un|una|stock)\b",
+        r"\b(?:quiero|quieres|ver|mostrar|muestra|muestrame|que|tienes|tienen|tiene|hay|habra|busco|buscar|necesito|dame|cuanto|cuales|disponibles|disponible|todos|las|los|el|la|de|por|menos|hasta|maximo|mil|catalogo|producto|productos|comprar|un|una|stock)\b",
         " ",
         query_text,
     )
-    query = " ".join(word for word in query.split() if not word.isdigit())
+    query = " ".join(word for word in re.findall(r"[a-z0-9]+", query) if not word.isdigit())
     query = re.sub(r"\badaptadores\b", "adaptador", query)
     return query, category, max_price
 
@@ -607,6 +668,13 @@ def start_purchase(session, product_id):
         return response("Ese producto no tiene un precio registrado y requiere cotización.", ["Hablar con un asesor"])
     session["flow"], session["data"] = "quantity", {"product_id": product["id"]}
     return response(f"{product['nombre']} cuesta {money(product['precio'])} y hay {product['stock']} disponible(s). ¿Cuántas unidades deseas?", ["1", "2", "Cancelar compra"])
+
+
+def payment_methods_for_cart(cart):
+    methods = ["Transferencia bancaria", "Efectivo", "Tarjeta"]
+    if cart and all(item["category"] in {"Audífonos", "Adaptadores"} for item in cart):
+        methods += ["Addi", "Sistecrédito"]
+    return methods
 
 
 def purchase_flow(session, message, text):
@@ -640,18 +708,20 @@ def purchase_flow(session, message, text):
         return response("Escribe la dirección de entrega. Para recoger en el local, escribe: Recoger en tienda.")
     if flow == "address":
         session["data"]["address"] = message.strip(); session["flow"] = "payment"
-        return response("Elige el método de pago. Addi y Sistecrédito aplican únicamente para accesorios.", ["Transferencia bancaria", "Efectivo", "Tarjeta", "Addi", "Sistecrédito"])
+        methods = payment_methods_for_cart(session["cart"])
+        payment_note = " Addi y Sistecrédito aplican únicamente para Audífonos y Adaptadores." if "Addi" in methods else ""
+        return response("Elige el método de pago." + payment_note, methods)
     if flow == "payment":
         methods = {"transferencia bancaria": "Transferencia bancaria", "efectivo": "Efectivo", "tarjeta": "Tarjeta", "addi": "Addi", "sistecredito": "Sistecrédito"}
         method = methods.get(text)
         if not method:
-            return response("Elige uno de los métodos mostrados.", list(methods.values()))
+            return response("Elige uno de los métodos mostrados.", payment_methods_for_cart(session["cart"]))
         if method in {"Addi", "Sistecrédito"} and any(item["category"] not in {"Audífonos", "Adaptadores"} for item in session["cart"]):
-            return response(f"{method} solo está disponible para accesorios. Elige otro método.", ["Transferencia bancaria", "Efectivo", "Tarjeta"])
+            return response(f"{method} solo está disponible para Audífonos y Adaptadores. Elige otro método.", payment_methods_for_cart(session["cart"]))
         try:
             code, subtotal = create_order({"name": session["data"]["name"], "phone": session["data"]["phone"]}, session["cart"], session["data"]["address"], method)
-        except ValueError as error:
-            session["flow"] = None
+        except (ValueError, RuntimeError, sqlite3.Error) as error:
+            session["cart"], session["flow"], session["data"] = [], None, {}
             return response(str(error), ["Ver catálogo", "Hablar con un asesor"])
         session["cart"], session["flow"], session["data"] = [], None, {}
         return response(f"✅ Pedido registrado\nCódigo: {code}\nSubtotal de productos: {money(subtotal)}\nEnvío: por cotizar con la transportadora\nPago: {method}\nEstado: Pendiente\n\nUn asesor confirmará el costo final de envío y el pago.", ["Ver catálogo", "Consultar pedido", "Hablar con un asesor"])
@@ -745,10 +815,30 @@ def select_last_product(session, text):
     product = get_product(results[index])
     if not product:
         return response("Ese producto ya no está activo en el catálogo.", ["Ver catálogo"])
-    if any(phrase in text for phrase in ["quiero comprar", "me llevo", "quiero ese", "como lo compro"]):
+    if re.search(r"\b(?:quiero(?: comprar)?|me llevo|comprar|como lo compro)\b", text):
         return start_purchase(session, product["id"])
     session["last_selected_id"] = product["id"]
     return product_card(product)
+
+
+def purchase_from_last_results(session, text):
+    pending = session.get("pending_result_purchase")
+    if pending and re.fullmatch(r"[1-5]", text):
+        index = int(text) - 1
+        if index < len(pending):
+            session.pop("pending_result_purchase", None)
+            return start_purchase(session, pending[index])
+        return response("Elige un número de los productos mostrados.")
+    if not re.search(r"\b(?:quiero comprar uno|quiero uno|comprar uno)\b", text):
+        return None
+    results = session.get("last_results", [])
+    if not results:
+        return response("Primero necesito mostrarte productos para que elijas uno.", ["Ver catálogo"])
+    if len(results) == 1:
+        return start_purchase(session, results[0])
+    session["pending_result_purchase"] = results.copy()
+    options = [str(index) for index in range(1, len(results) + 1)]
+    return response("¿Cuál producto quieres comprar? Responde con el número de la lista mostrada.", options)
 
 
 def compare_last_products(session):
@@ -815,12 +905,21 @@ def process_message(message, session_id="default"):
                 return start_purchase(session, product["id"])
             session["last_selected_id"] = product["id"]
             return product_card(product)
+    redmi_buds = redmi_buds_search(session, control_text)
+    if redmi_buds:
+        return redmi_buds
     named_product = specific_product_response(session, control_text)
     if named_product:
         return named_product
+    displayed_follow_up = last_results_follow_up(session, control_text)
+    if displayed_follow_up:
+        return displayed_follow_up
     result_follow_up = result_conversation(session, control_text)
     if result_follow_up:
         return result_follow_up
+    pending_purchase = purchase_from_last_results(session, text)
+    if pending_purchase:
+        return pending_purchase
     selected = select_last_product(session, text)
     if selected:
         return selected

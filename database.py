@@ -1,4 +1,5 @@
 import sqlite3
+import secrets
 from datetime import datetime
 from pathlib import Path
 
@@ -82,18 +83,76 @@ def get_product(product_id):
 
 def create_order(customer, cart, address, payment_method):
     with get_connection() as connection:
+        if not cart:
+            raise ValueError("El carrito está vacío.")
+
+        quantities = {}
         for item in cart:
-            product = connection.execute("SELECT * FROM productos WHERE id=? AND activo=1", (item["product_id"],)).fetchone()
-            if not product or product["stock"] < item["quantity"]:
-                raise ValueError(f"El producto seleccionado ya no tiene stock suficiente: {item['name']}.")
-        connection.execute("INSERT INTO clientes (nombre,telefono) VALUES (?,?) ON CONFLICT(telefono) DO UPDATE SET nombre=excluded.nombre", (customer["name"], customer["phone"]))
-        client = connection.execute("SELECT id FROM clientes WHERE telefono=?", (customer["phone"],)).fetchone()
-        subtotal = sum(item["price"] * item["quantity"] for item in cart)
-        code = "ZT-" + datetime.now().strftime("%Y%m%d%H%M%S")
-        cursor = connection.execute("INSERT INTO pedidos (codigo,cliente_id,subtotal,costo_envio,total,metodo_pago,direccion_entrega,estado) VALUES (?,?,?,0,?,?,?,'Pendiente')", (code, client["id"], subtotal, subtotal, payment_method, address))
-        for item in cart:
-            connection.execute("INSERT INTO detalle_pedido (pedido_id,producto_id,cantidad,precio_unitario,subtotal) VALUES (?,?,?,?,?)", (cursor.lastrowid, item["product_id"], item["quantity"], item["price"], item["price"] * item["quantity"]))
-            connection.execute("UPDATE productos SET stock=stock-?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (item["quantity"], item["product_id"]))
+            product_id = item.get("product_id")
+            quantity = item.get("quantity")
+            if not isinstance(product_id, int) or not isinstance(quantity, int) or quantity < 1:
+                raise ValueError("El carrito contiene una cantidad o producto inválido.")
+            quantities[product_id] = quantities.get(product_id, 0) + quantity
+
+        order_items = []
+        for product_id, quantity in quantities.items():
+            product = connection.execute(
+                "SELECT * FROM productos WHERE id=? AND activo=1",
+                (product_id,),
+            ).fetchone()
+            if not product or product["precio"] is None:
+                raise ValueError("El producto seleccionado ya no está disponible para compra.")
+            if payment_method in {"Addi", "Sistecrédito"} and product["categoria"] not in {"Audífonos", "Adaptadores"}:
+                raise ValueError(f"{payment_method} solo está disponible para Audífonos y Adaptadores.")
+
+            updated = connection.execute(
+                """UPDATE productos
+                SET stock=stock-?, updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND activo=1 AND stock>=?""",
+                (quantity, product_id, quantity),
+            ).rowcount
+            if updated != 1:
+                raise ValueError(f"El producto seleccionado ya no tiene stock suficiente: {product['nombre']}.")
+            order_items.append((product, quantity))
+
+        subtotal = sum(product["precio"] * quantity for product, quantity in order_items)
+        connection.execute(
+            "INSERT INTO clientes (nombre,telefono) VALUES (?,?) "
+            "ON CONFLICT(telefono) DO UPDATE SET nombre=excluded.nombre",
+            (customer["name"], customer["phone"]),
+        )
+        client = connection.execute(
+            "SELECT id FROM clientes WHERE telefono=?",
+            (customer["phone"],),
+        ).fetchone()
+
+        cursor = None
+        code = None
+        for _ in range(8):
+            candidate = "ZT-" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + secrets.token_hex(2).upper()
+            try:
+                cursor = connection.execute(
+                    """INSERT INTO pedidos
+                    (codigo,cliente_id,subtotal,costo_envio,total,metodo_pago,direccion_entrega,estado)
+                    VALUES (?,?,?,0,?,?,?,'Pendiente')""",
+                    (candidate, client["id"], subtotal, subtotal, payment_method, address),
+                )
+                code = candidate
+                break
+            except sqlite3.IntegrityError as error:
+                if "pedidos.codigo" not in str(error):
+                    raise
+        if cursor is None or code is None:
+            raise RuntimeError("No fue posible generar un código único para el pedido.")
+
+        for product, quantity in order_items:
+            item_subtotal = product["precio"] * quantity
+            connection.execute(
+                """INSERT INTO detalle_pedido
+                (pedido_id,producto_id,cantidad,precio_unitario,subtotal)
+                VALUES (?,?,?,?,?)""",
+                (cursor.lastrowid, product["id"], quantity, product["precio"], item_subtotal),
+            )
     return code, subtotal
 
 
