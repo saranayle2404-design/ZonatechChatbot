@@ -20,6 +20,12 @@ def create_app():
         session_id = data.get("session_id", "default")
         if not isinstance(message, str) or not message.strip():
             return jsonify({"error": "Escribe un mensaje para continuar."}), 400
+        if session_id is None or session_id == "":
+            session_id = "default"
+        elif not isinstance(session_id, str):
+            return jsonify({"error": "session_id debe ser un texto válido."}), 400
+        elif len(session_id) > 200:
+            return jsonify({"error": "session_id excede la longitud permitida."}), 400
         return jsonify(process_message(message, session_id))
 
     return app

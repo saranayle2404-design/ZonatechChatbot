@@ -691,7 +691,7 @@ def parse_search(text):
         max_price = value * (1_000_000 if unit.startswith("millon") else (1000 if unit else 1))
         query_text = query_text[:amount.start()] + " " + query_text[amount.end():]
     query = re.sub(
-        r"\b(?:quiero|quieres|ver|mostrar|muestra|muestrame|que|tienes|tienen|tiene|hay|habra|busco|buscar|necesito|dame|cuanto|cuales|disponibles|disponible|todos|las|los|el|la|de|por|menos|hasta|maximo|mil|catalogo|producto|productos|comprar|un|una|stock|algo|alguna|alguno|cualquier|cualquiera)\b",
+        r"\b(?:quiero|quieres|ver|mostrar|muestra|muestrame|que|tienes|tienen|tiene|hay|habra|busco|buscar|necesito|dame|cuanto|cuales|disponibles|disponible|todos|las|los|el|la|de|por|para|cosas|menos|hasta|maximo|mil|catalogo|producto|productos|comprar|un|una|stock|algo|alguna|alguno|cualquier|cualquiera)\b",
         " ",
         query_text,
     )
@@ -715,8 +715,11 @@ def explicit_catalog_request(text):
     """True when a message explicitly starts a new catalog search."""
     _, category, _, brand = parse_catalog_search(text)
     category = category or category_for_text(text)
-    request = bool(re.search(r"\b(?:muestrame|muestra|ver|quiero|busco|necesito)\b", text))
-    return request and bool(category or brand)
+    request = bool(re.search(r"\b(?:muestrame|muestra|ver|quiero|busco|necesito|tienes|tienen|tiene|hay|venden|vende)\b", text))
+    bare_structured_filters = bool(category or brand) and not re.search(
+        r"\b(?:un|una|unos|unas|por|para|con|de|favor)\b", text,
+    )
+    return (request or bare_structured_filters) and bool(category or brand)
 
 
 def clear_purchase_state(session):
@@ -1052,8 +1055,25 @@ def process_message(message, session_id="default"):
         return discovery
     explicit_query, explicit_category, explicit_max_price, explicit_brand = parse_catalog_search(text)
     explicit_category = explicit_category or category_for_text(text)
-    explicit_request = bool(re.search(r"\b(?:muestrame|muestra|ver|quiero|busco|necesito)\b", text))
-    if explicit_request and (explicit_category or explicit_brand):
+    iphone_phone_request = (
+        explicit_category is None
+        and "iphone" in text
+        and (
+            bool(re.search(r"\b(?:tienes|tienen|tiene|hay|venden|vende)\b", text))
+            or bool(re.search(r"\bque\s+iphone\s+tienen\b", text))
+        )
+    )
+    if iphone_phone_request:
+        categories = {normalize(row["categoria"]): row["categoria"] for row in list_categories()}
+        explicit_category = categories.get("celulares")
+        explicit_brand = active_brands().get("apple")
+    explicit_request = bool(re.search(r"\b(?:muestrame|muestra|ver|quiero|busco|necesito|tienes|tienen|tiene|hay|venden|vende)\b", text))
+    structured_filters = bool(explicit_category or explicit_brand)
+    if explicit_max_price is not None and not structured_filters and not explicit_query:
+        conversation = conversation_for(session)
+        conversation.clear()
+        return show_products(session, "", None, explicit_max_price, "disponible" in text)
+    if (explicit_request or explicit_catalog_request(text)) and structured_filters:
         conversation = conversation_for(session)
         conversation.clear()
         conversation.update({

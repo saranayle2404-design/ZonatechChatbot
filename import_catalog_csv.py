@@ -191,6 +191,25 @@ def detect_category(name, description, current_category):
     name_key = normalize_key(" ".join((name, description)))
     category_key = normalize_key(current_category)
 
+    # Los relojes identificables deben ganar sobre la regla genérica de
+    # celulares Huawei/Samsung/Xiaomi, salvo que el producto sea claramente
+    # un accesorio para reloj.
+    if (
+        not re.search(
+            r"\b(cable|cables|lightning|usb[- ]?c|type[- ]?c|cargador|"
+            r"cargadores|charger|cabeza|forro|forros|funda|fundas|case|"
+            r"vidrio|vidrios|templado|protector|hidrogel)\b",
+            name_key,
+        )
+        and re.search(
+            r"\b(smart\s*watch|smartwatch|smart\s*band|"
+            r"(?:samsung\s+)?galaxy\s+watch|(?:apple|huawei|xiaomi)\s+watch|"
+            r"watch\s+fit)\b",
+            name_key,
+        )
+    ):
+        return "Smartwatch"
+
     # Un Redmi Note con modelo sigue siendo un celular aunque incluya
     # accesorios promocionales, como +BUDS o +PARLANTE.
     if re.search(r"\bredmi\s+note\s+\d+\b", name_key):
