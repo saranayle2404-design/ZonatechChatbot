@@ -2,6 +2,7 @@ import math
 import re
 import sqlite3
 import unicodedata
+from datetime import datetime, timedelta
 
 from database import (
     create_order, create_repair, get_product, get_repair_by_code_and_phone,
@@ -10,6 +11,19 @@ from database import (
 
 SESSIONS = {}
 PAGE_SIZE = 5
+
+# El código de reparación es secuencial y predecible (ZT-R-YYYYMMDD-0001), y
+# el teléfono no es un secreto fuerte, así que "código + teléfono" por sí solo
+# es una credencial débil. Sin límite de intentos, alguien con el teléfono de
+# otra persona podría probar pocos códigos por fecha hasta acertar. Este
+# límite hace que ese ataque sea impráctico sin necesidad de rediseñar el
+# formato del código, que es visible y usado por el negocio.
+REPAIR_LOOKUP_MAX_ATTEMPTS = 5
+REPAIR_LOOKUP_LOCKOUT = timedelta(minutes=15)
+
+# Ver docstring de catalog_terms() para el porqué de este caché.
+_CATALOG_TERMS_CACHE = {"terms": None, "expires_at": None}
+CATALOG_TERMS_TTL = timedelta(minutes=5)
 BUSINESS_INFO = {"phone": "313 820 4477", "address": "Carrera 96B #19-19, Bogotá, Colombia", "hours": "9:30 a. m. a 8:00 p. m."}
 
 MAIN_MENU_OPTIONS = [
@@ -71,7 +85,21 @@ def edit_distance(left, right):
 
 
 def catalog_terms():
-    """Returns normalized real catalog words plus a compact conversational vocabulary."""
+    """Returns normalized real catalog words plus a compact conversational vocabulary.
+
+    Se cachea con un TTL corto: antes esto reconstruía el vocabulario completo
+    (hasta 1000 productos) desde SQLite en cada mensaje que pasara por
+    corrección ortográfica difusa, lo cual con el catálogo real (488
+    productos) hacía de cada mensaje "raro" una operación cara y fácil de
+    saturar en ráfaga. El costo es que, tras un `import_catalog_csv.py`
+    corrido mientras la app está viva, el vocabulario puede tardar hasta
+    CATALOG_TERMS_TTL en reflejar productos nuevos — aceptable para
+    autocompletado/corrección, no para datos que deban ser exactos al
+    instante.
+    """
+    now = datetime.now()
+    if _CATALOG_TERMS_CACHE["terms"] is not None and _CATALOG_TERMS_CACHE["expires_at"] > now:
+        return _CATALOG_TERMS_CACHE["terms"]
     terms = set(CONVERSATION_TERMS)
     for row in list_categories():
         terms.update(normalize(row["categoria"]).split())
@@ -79,6 +107,8 @@ def catalog_terms():
     for product in products:
         for field in ("nombre", "marca", "modelo"):
             terms.update(word for word in normalize(product[field] or "").split() if len(word) >= 4)
+    _CATALOG_TERMS_CACHE["terms"] = terms
+    _CATALOG_TERMS_CACHE["expires_at"] = now + CATALOG_TERMS_TTL
     return terms
 
 
@@ -114,7 +144,31 @@ def response(text, quick_replies=None):
 
 
 def session_for(session_id):
-    return SESSIONS.setdefault(session_id, {"cart": [], "flow": None, "data": {}, "last_search": {}, "last_results": [], "last_selected_id": None, "conversation": {}})
+    return SESSIONS.setdefault(session_id, {
+        "cart": [], "flow": None, "data": {}, "last_search": {}, "last_results": [],
+        "last_selected_id": None, "conversation": {},
+        "repair_lookup": {"failed_attempts": 0, "locked_until": None},
+    })
+
+
+def repair_lookup_locked(session):
+    """Returns the remaining lockout as a timedelta, or None if not locked."""
+    locked_until = session.setdefault("repair_lookup", {"failed_attempts": 0, "locked_until": None}).get("locked_until")
+    if locked_until and datetime.now() < locked_until:
+        return locked_until - datetime.now()
+    return None
+
+
+def register_repair_lookup_result(session, found):
+    state = session.setdefault("repair_lookup", {"failed_attempts": 0, "locked_until": None})
+    if found:
+        state["failed_attempts"] = 0
+        state["locked_until"] = None
+        return
+    state["failed_attempts"] += 1
+    if state["failed_attempts"] >= REPAIR_LOOKUP_MAX_ATTEMPTS:
+        state["locked_until"] = datetime.now() + REPAIR_LOOKUP_LOCKOUT
+        state["failed_attempts"] = 0
 
 
 def conversation_for(session):
@@ -884,6 +938,7 @@ def repair_flow(session, message, text):
             return response("El telefono debe tener 10 digitos. Intentalo nuevamente.")
         repair = get_repair_by_code_and_phone(session["data"]["repair_code"], phone)
         session["flow"], session["data"] = None, {}
+        register_repair_lookup_result(session, found=bool(repair))
         if not repair:
             return response("No encontramos una reparacion con esos datos. Verifica el codigo y numero de telefono o habla con un asesor.", ["Consultar mi reparacion", "Hablar con un asesor"])
         return repair_status_message(repair)
@@ -895,6 +950,10 @@ def start_repair(session):
 
 
 def start_repair_lookup(session):
+    remaining = repair_lookup_locked(session)
+    if remaining is not None:
+        minutes = max(1, math.ceil(remaining.total_seconds() / 60))
+        return response(f"Por seguridad, bloqueamos temporalmente la consulta de reparaciones por demasiados intentos fallidos. Intenta de nuevo en {minutes} minuto(s), o habla con un asesor.", ["Hablar con un asesor"])
     session["flow"], session["data"] = "repair_lookup_code", {}
     return response("Escribe tu codigo de reparacion. Ejemplo: ZT-R-20260910-0001.", ["Cancelar consulta"])
 

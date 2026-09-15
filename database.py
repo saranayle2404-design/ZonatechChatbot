@@ -131,7 +131,10 @@ def create_order(customer, cart, address, payment_method):
         cursor = None
         code = None
         for _ in range(8):
-            candidate = "ZT-" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + secrets.token_hex(2).upper()
+            # token_hex(2) daba solo 65.536 combinaciones posibles (2 bytes),
+            # adivinables por fuerza bruta si el código se usa como parte de
+            # una credencial de consulta. token_hex(6) da ~2.8e14 combinaciones.
+            candidate = "ZT-" + datetime.now().strftime("%Y%m%d%H%M%S") + "-" + secrets.token_hex(6).upper()
             try:
                 cursor = connection.execute(
                     """INSERT INTO pedidos
