@@ -1052,38 +1052,51 @@ def process_message(message, session_id="default"):
     control_text = normalize(message.strip())
     text, uncertain = fuzzy_normalize(control_text)
 
-    # 1. Flujos activos prioritarios (Checkout del carrito o Registro de reparaciones)
+    # 1. FLUJOS ACTIVOS (Req 5 y 7: Compras y Reparaciones)
     if session.get("flow"):
         if session["flow"].startswith("repair_"):
             return repair_flow(session, message, text)
         if purchase_cancel_intent(control_text):
             clear_purchase_state(session)
             return response("Compra cancelada. El carrito fue limpiado.", ["Ver catálogo"])
-        return purchase_flow(session, message, text)
+        if explicit_catalog_request(control_text):
+            clear_purchase_state(session)
+        else:
+            return purchase_flow(session, message, text)
 
-    # 2. Consultas informativas, soporte y navegación básica
-    if payment_info_intent(control_text) or any(phrase in text for phrase in ["pagos y envios", "metodo de pago", "metodos de pago", "formas de pago", "medios de pago", "domicilio", "envio", "transportadora"]):
+    # 2. INFORMACIÓN DIRECTA (Req 1, 6, 9, 10, 11: Pagos, Garantía, Asesor, Menú)
+    if payment_info_intent(control_text) or any(phrase in text for phrase in [
+        "pagos y envios", "metodo de pago", "metodos de pago", "formas de pago",
+        "medios de pago"
+    ]):
         return payments_and_shipping_info()
     if any(phrase in text for phrase in ["ubicacion", "donde estan", "donde queda", "direccion", "horario", "horarios"]):
         return location_and_hours_info()
     if "garantia" in text:
         return warranty_info()
-    if re.search(r"(?:asesor|persona|humano|humana|hablar con alguien|necesito ayuda|contactar)", control_text):
+    if re.search(r"(?:asesor|persona|humano|humana|hablar con alguien|necesito ayuda|contactar|atencion personalizada)", control_text):
         return advisor_info()
     if any(option in control_text for option in ["menu", "inicio", "volver", "principal"]) or re.fullmatch(r"(?:hola+|hey|buenas?|buenos dias|buenas tardes|buenas noches|que tal)(?:\s+.*)?", text):
         session["flow"], session["data"] = None, {}
         clear_conversation(session)
         return main_menu()
-    if "comprar productos" in control_text or text in {"catalogo", "ver catalogo", "muestrame el catalogo", "que tienen disponible", "que productos venden"}:
+    if "comprar productos" in control_text or text in {"catalogo", "ver catalogo", "muestrame el catalogo", "quiero ver el catalogo", "que tienen disponible", "que productos venden"}:
         return catalog_menu()
 
-    # 3. Flujos de Reparación
+    # 3. REPARACIONES DIRECTAS (Req 7 y 8)
     if repair_intent(control_text):
         return start_repair(session)
     if any(phrase in control_text for phrase in ["consultar mi reparacion", "consultar reparacion", "estado de reparacion", "como va mi reparacion"]):
         return start_repair_lookup(session)
 
-    # 4. Interacción con botones de productos (Clics en "Ver producto #X" o "Comprar")
+    # 4. CONTEXTO ESPECIAL AUDÍFONOS (Req 4: Música, Llamadas...)
+    conversation = session.get("conversation", {})
+    if re.fullmatch(r"(?:musica|llamadas|gaming|uso diario)", control_text) and normalize(str(conversation.get("interest", ""))) == "audifonos":
+        conversational_response = conversational_search(session, message, control_text)
+        if conversational_response:
+            return conversational_response
+
+    # 5. CONTEXTO POSICIONAL Y RESULTADOS ANTERIORES (Req 2 y 3)
     if text.startswith("ver producto #") or text.startswith("comprar #"):
         product_id = re.search(r"#(\d+)", text)
         if product_id:
@@ -1094,28 +1107,93 @@ def process_message(message, session_id="default"):
                 return start_purchase(session, product["id"])
             session["last_selected_id"] = product["id"]
             return product_card(product)
-            
+
+    displayed_follow_up = last_results_follow_up(session, control_text)
+    if displayed_follow_up: return displayed_follow_up
+
+    result_follow_up = result_conversation(session, control_text)
+    if result_follow_up: return result_follow_up
+
+    selected = select_last_product(session, control_text)
+    if selected: return selected
+
     pending_purchase = purchase_from_last_results(session, control_text)
-    if pending_purchase:
-        return pending_purchase
-        
+    if pending_purchase: return pending_purchase
+
     selected_purchase = purchase_selected_product(session, text)
-    if selected_purchase:
-        return selected_purchase
+    if selected_purchase: return selected_purchase
+
+    if re.search(r"\b(?:cual es mejor|cual me recomiendas|que me recomiendas|que recomiendas|cual recomiendas|cual elegirias|cual deberia comprar|cual me conviene|que comprarias tu|entre estos)\b", control_text):
+        return recommend_from_context(session)
+
+    next_page = bool(re.search(r"\b(?:siguiente(?:s)?(?: pagina)?|pagina siguiente|muestrame(?: los)? siguientes|muestra(?: los)? siguientes|ver mas|muestrame mas|muestra mas)\b", control_text)) or control_text == "mas"
+    previous_page = bool(re.search(r"\b(?:pagina anterior|anterior)\b", control_text))
+    if next_page or previous_page:
+        options = session.get("last_search", {})
+        if not options: return catalog_menu()
+        total = last_search_total(session)
+        pages = math.ceil(total / PAGE_SIZE) if total else 1
+        if next_page and options.get("page", 1) >= pages:
+            return response("Ya estás viendo la última página de esos resultados.", ["Ver catálogo"])
+        options["page"] = max(1, options.get("page", 1) + (1 if next_page else -1))
+        return show_products(session, **options)
+
+    # 6. FILTROS ESTRUCTURADOS (Req 3: "Quiero un iPhone", "Quiero audífonos JBL")
+    discovery = None
+    if re.search(r"\b(?:quiero|necesito|busco|recomiendas?|cambiar)\b", text) and product_interest(text):
+        discovery = start_discovery(session, text)
+    if discovery:
+        return discovery
+
+    explicit_query, explicit_category, explicit_max_price, explicit_brand = parse_catalog_search(text)
+    explicit_category = explicit_category or category_for_text(text)
+
+    iphone_phone_request = (
+        "iphone" in text
+        and (explicit_category is None or normalize(explicit_category) in {"celulares", "iphone"})
+        and not re.search(r"\b(?:cable|cables|cargador|cargadores|cabeza|forro|forros|vidrio|vidrios|hidrogel|audifono|audifonos|cosas|accesorios|productos)\b", text)
+        and bool(re.search(r"\b(?:quiero|busco|necesito|tienes|tienen|tiene|hay|venden|vende|muestrame|muestra|ver)\b", text))
+    )
+    if iphone_phone_request:
+        categories = {normalize(row["categoria"]): row["categoria"] for row in list_categories()}
+        explicit_category = categories.get("celulares")
+        explicit_brand = active_brands().get("apple")
+        explicit_query = re.sub(r"\biphone\b", " ", explicit_query)
+        explicit_query = " ".join(explicit_query.split())
+
+    explicit_request = bool(re.search(r"\b(?:muestrame|muestra|ver|quiero|busco|necesito|tienes|tienen|tiene|hay|venden|vende)\b", text))
+    structured_filters = bool(explicit_category or explicit_brand)
+
+    if (explicit_request or explicit_catalog_request(text)) and structured_filters:
+        conversation = conversation_for(session)
+        conversation.clear()
+        conversation.update({
+            "interest": explicit_category,
+            "category": explicit_category,
+            "brand": explicit_brand,
+            "query": explicit_query,
+            "budget": explicit_max_price,
+            "stage": "search",
+        })
+        return show_products(
+            session, explicit_query, explicit_category, explicit_max_price,
+            "disponible" in text, brand=explicit_brand, raw_message=message,
+        )
+
+    conversational_response = conversational_search(session, message, control_text)
+    if conversational_response:
+        return conversational_response
 
     # =====================================================================
-    # 5. MOTOR DE EMBEDDINGS DIRECTO (BÚSQUEDA SEMÁNTICA)
+    # 7. MOTOR SEMÁNTICO (El núcleo de búsqueda IA libre para lo demás)
     # =====================================================================
-    # Cualquier texto libre que no sea navegación de menú ni flujos activos,
-    # entra directamente aquí para buscar por significado (similitud vectorial).
-    
     semantic_matches = semantic_product_matches(message)
-    
     if semantic_matches:
+        # Esto guarda los resultados en sesión. 
+        # ¡Así Req 3 ("Cual es el mas barato") funciona también con la IA!
         return show_semantic_matches(session, semantic_matches)
-        
-    # Si el modelo no devuelve nada (o el usuario escribe algo sin sentido)
-    return response(
-        "No encontré opciones en el catálogo con esas palabras. ¿Podrías darme otro detalle o nombre?", 
-        ["Ver catálogo", "Hablar con un asesor"]
-    )
+
+    if uncertain:
+        return response("No estoy seguro de qué quisiste decir 😅 ¿Puedes intentarlo con otras palabras o decirme qué buscas?", ["Ver catálogo", "Hablar con un asesor"])
+
+    return response("No encontré opciones exactas en el catálogo con esas palabras. ¿Podrías darme otro detalle o nombre?", ["Ver catálogo", "Hablar con un asesor"])
