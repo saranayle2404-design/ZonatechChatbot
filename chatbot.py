@@ -185,16 +185,23 @@ def last_result_products(session):
 
 def ordinal_result_product(products, text):
     match = re.search(
-        r"\b(?:el |la )?(primero|primera|segundo|segunda|tercero|tercera|ultimo|ultima|final)\b",
+        r"\b(?:el |la )?(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|ultimo|ultima|final)\b",
         text,
     )
-    if not match:
-        return None, False
     positions = {
         "primero": 0, "primera": 0, "segundo": 1, "segunda": 1,
-        "tercero": 2, "tercera": 2, "ultimo": -1, "ultima": -1, "final": -1,
+        "tercero": 2, "tercera": 2, "cuarto": 3, "cuarta": 3,
+        "ultimo": -1, "ultima": -1, "final": -1,
     }
-    index = positions[match.group(1)]
+    if match:
+        index = positions[match.group(1)]
+    else:
+        numeric = re.search(r"\b(?:numero|no)\s*(\d+)\b", text)
+        if not numeric:
+            return None, False
+        index = int(numeric.group(1)) - 1
+        if index < 0:
+            return None, True
     if not products or (index >= len(products) and index != -1):
         return None, True
     return products[index], True
@@ -527,7 +534,7 @@ def conversational_search(session, message, text):
         )
         return result
     audio_use = re.search(r"\b(?:musica|llamadas|gaming|uso diario)\b", text)
-    if audio_use and conversation.get("interest") == "audifonos":
+    if audio_use and normalize(conversation.get("interest", "")) == "audifonos":
         conversation["use"] = audio_use.group(0)
         conversation["stage"] = "budget"
         return response("Perfecto 🎧 ¿Tienes un presupuesto máximo?")
@@ -587,6 +594,17 @@ def payments_and_shipping_info():
         "Para envíos nacionales, el tiempo estimado es de 2 a 3 días.",
         RETURN_OPTIONS,
     )
+
+
+def payment_info_intent(text):
+    """Recognize natural questions about payment methods without matching product searches."""
+    normalized = normalize(text)
+    if re.search(r"\b(?:como|con\s+que)\b.*\bpagar\b", normalized):
+        return True
+    return bool(re.search(
+        r"\b(?:que|cuales)\b.*\b(?:medios?|formas?|metodos?|opciones?)\b.*\bpago\b",
+        normalized,
+    ))
 
 
 def location_and_hours_info():
@@ -749,7 +767,8 @@ def start_purchase(session, product_id):
 
 def payment_methods_for_cart(cart):
     methods = ["Transferencia bancaria", "Efectivo", "Tarjeta"]
-    if cart and all(item["category"] in {"Audífonos", "Adaptadores"} for item in cart):
+    eligible_categories = {"audifonos", "adaptadores"}
+    if cart and all(normalize(str(item.get("category", ""))) in eligible_categories for item in cart):
         methods += ["Addi", "Sistecrédito"]
     return methods
 
@@ -945,6 +964,16 @@ def purchase_selected_product(session, text):
 def process_message(message, session_id="default"):
     session = session_for(session_id)
     control_text = normalize(message.strip())
+    if payment_info_intent(control_text):
+        return payments_and_shipping_info()
+    conversation = session.get("conversation", {})
+    if (
+        re.fullmatch(r"(?:musica|llamadas|gaming|uso diario)", control_text)
+        and normalize(str(conversation.get("interest", ""))) == "audifonos"
+    ):
+        conversational_response = conversational_search(session, message, control_text)
+        if conversational_response:
+            return conversational_response
     text, uncertain = fuzzy_normalize(control_text)
     if repair_intent(control_text):
         return start_repair(session)
@@ -965,11 +994,14 @@ def process_message(message, session_id="default"):
         return main_menu()
     if "comprar productos" in control_text:
         return catalog_menu()
-    if re.search(r"asesor|persona|humano|humana|hablar con alguien|necesito ayuda", text):
+    if re.search(r"(?:asesor|persona|humano|humana|hablar con alguien|necesito ayuda|contactar con|atencion personalizada)", control_text):
         return advisor_info()
     if "garantia" in text:
         return warranty_info()
-    if any(phrase in text for phrase in ["pagos y envios", "metodo de pago", "metodos de pago", "formas de pago"]):
+    if payment_info_intent(text) or any(phrase in text for phrase in [
+        "pagos y envios", "metodo de pago", "metodos de pago", "formas de pago",
+        "medios de pago",
+    ]):
         return payments_and_shipping_info()
     if any(phrase in text for phrase in ["ubicacion", "donde estan", "donde queda", "direccion", "horario", "horarios"]):
         return location_and_hours_info()
@@ -995,10 +1027,10 @@ def process_message(message, session_id="default"):
     result_follow_up = result_conversation(session, control_text)
     if result_follow_up:
         return result_follow_up
-    pending_purchase = purchase_from_last_results(session, text)
+    pending_purchase = purchase_from_last_results(session, control_text)
     if pending_purchase:
         return pending_purchase
-    selected = select_last_product(session, text)
+    selected = select_last_product(session, control_text)
     if selected:
         return selected
     selected_purchase = purchase_selected_product(session, text)
@@ -1056,17 +1088,17 @@ def process_message(message, session_id="default"):
     explicit_query, explicit_category, explicit_max_price, explicit_brand = parse_catalog_search(text)
     explicit_category = explicit_category or category_for_text(text)
     iphone_phone_request = (
-        explicit_category is None
-        and "iphone" in text
-        and (
-            bool(re.search(r"\b(?:tienes|tienen|tiene|hay|venden|vende)\b", text))
-            or bool(re.search(r"\bque\s+iphone\s+tienen\b", text))
-        )
+        "iphone" in text
+        and (explicit_category is None or normalize(explicit_category) in {"celulares", "iphone"})
+        and not re.search(r"\b(?:cable|cables|cargador|cargadores|cabeza|forro|forros|vidrio|vidrios|hidrogel|audifono|audifonos|cosas|accesorios|productos)\b", text)
+        and bool(re.search(r"\b(?:quiero|busco|necesito|tienes|tienen|tiene|hay|venden|vende|muestrame|muestra|ver)\b", text))
     )
     if iphone_phone_request:
         categories = {normalize(row["categoria"]): row["categoria"] for row in list_categories()}
         explicit_category = categories.get("celulares")
         explicit_brand = active_brands().get("apple")
+        explicit_query = re.sub(r"\biphone\b", " ", explicit_query)
+        explicit_query = " ".join(explicit_query.split())
     explicit_request = bool(re.search(r"\b(?:muestrame|muestra|ver|quiero|busco|necesito|tienes|tienen|tiene|hay|venden|vende)\b", text))
     structured_filters = bool(explicit_category or explicit_brand)
     if explicit_max_price is not None and not structured_filters and not explicit_query:
