@@ -8,6 +8,7 @@ from flask_limiter.util import get_remote_address
 
 from chatbot import process_message
 from database import initialize_database
+from semantic_search import warmup
 
 
 MAX_MESSAGE_LENGTH = 1000  # el index.html ya limita a 500 en el input, esto es el candado real del servidor
@@ -99,12 +100,10 @@ def create_app():
 
 app = create_app()
 
-
 if __name__ == "__main__":
-    # El modo debug de Flask/Werkzeug expone un depurador interactivo que
-    # permite ejecutar código arbitrario en el servidor ante cualquier
-    # excepción no controlada. NUNCA debe activarse en producción.
-    # Se habilita solo si se define explícitamente FLASK_DEBUG=1, y aun así
-    # solo escucha en localhost para no exponer el depurador en la red.
+    # Inicia la carga pesada ANTES de exponer la app al cliente
+    warmup()
+    
+    # El modo debug de Flask/Werkzeug...
     debug_mode = os.environ.get("FLASK_DEBUG") == "1"
     app.run(debug=debug_mode, host="127.0.0.1", port=5000)

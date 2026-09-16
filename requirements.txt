@@ -1,2 +1,9 @@
 Flask==3.1.3
 Flask-Limiter==4.1.1
+
+# Búsqueda semántica local del catálogo (sin API externa, sin key, sin
+# límite de peticiones ajeno). El modelo (~470 MB) se descarga UNA sola vez
+# la primera vez que corre la app, y luego queda en caché local: necesitas
+# internet solo esa primera vez, después funciona 100% offline.
+sentence-transformers==3.3.1
+numpy>=1.26,<3
