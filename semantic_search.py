@@ -66,6 +66,29 @@ def is_available():
     return _get_model() is not None
 
 
+def warmup():
+    """Pre-carga el modelo y fuerza la inicialización de forma segura."""
+    print("⏳ [Paso 1/3] Iniciando precalentamiento del motor de IA...")
+    try:
+        model = _get_model()
+        if model is None:
+            print("❌ Advertencia: No se pudo cargar el modelo de IA.")
+            return
+
+        print("⏳ [Paso 2/3] Modelo cargado. Vectorizando el catálogo (esto puede tardar si hay miles de productos)...")
+        # Aquí es donde se leen los productos de SQLite y se convierten a vectores
+        _catalog_embeddings(model)
+
+        print("⏳ [Paso 3/3] Forzando activación matemática de PyTorch...")
+        model.encode(["simulacro de activacion"], normalize_embeddings=True)
+
+        print("✅ Motor de IA cargado en RAM exitosamente. ¡El chat responderá al instante!")
+        
+    except Exception as e:
+        print(f"⚠️ Error durante el precalentamiento: {e}")
+        print("⚠️ El servidor seguirá encendido, pero el chat podría ser más lento en el primer mensaje.")
+
+
 def _product_text(product):
     parts = [product["nombre"], product["categoria"], product["marca"] or "", product["descripcion"] or ""]
     return " . ".join(part for part in parts if part)
@@ -104,11 +127,3 @@ def semantic_product_matches(query, min_similarity=MIN_SIMILARITY, max_results=M
         return [product for product, score in ranked[:max_results] if score >= min_similarity]
     except Exception:
         return []
-
-def warmup():
-    """Pre-carga el modelo y el catálogo antes de encender el servidor web."""
-    print("⏳ Iniciando precalentamiento del motor de IA (esto tomará unos segundos)...")
-    model = _get_model()
-    if model is not None:
-        _catalog_embeddings(model)
-    print("✅ Motor de IA cargado en RAM. ¡El chat responderá al instante!")

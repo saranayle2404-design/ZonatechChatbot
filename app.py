@@ -60,6 +60,9 @@ def create_app():
 
     initialize_database()
 
+    # Precarga el modelo de búsqueda semántica y los embeddings del catálogo
+    # ANTES de exponer la app al cliente, para que la primera petición real
+    # no pague el costo de esa carga inicial.
     warmup()
 
     @app.get("/")
@@ -102,10 +105,12 @@ def create_app():
 
 app = create_app()
 
-if __name__ == "__main__":
-    # Inicia la carga pesada ANTES de exponer la app al cliente
 
-    
-    # El modo debug de Flask/Werkzeug...
+if __name__ == "__main__":
+    # El modo debug de Flask/Werkzeug expone un depurador interactivo que
+    # permite ejecutar código arbitrario en el servidor ante cualquier
+    # excepción no controlada. NUNCA debe activarse en producción.
+    # Se habilita solo si se define explícitamente FLASK_DEBUG=1, y aun así
+    # solo escucha en localhost para no exponer el depurador en la red.
     debug_mode = os.environ.get("FLASK_DEBUG") == "1"
     app.run(debug=debug_mode, host="127.0.0.1", port=5000)
