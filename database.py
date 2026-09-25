@@ -26,6 +26,16 @@ def initialize_database():
             CREATE TABLE IF NOT EXISTS pedidos (id INTEGER PRIMARY KEY AUTOINCREMENT, codigo TEXT NOT NULL UNIQUE, cliente_id INTEGER NOT NULL, subtotal REAL NOT NULL DEFAULT 0, costo_envio REAL NOT NULL DEFAULT 0, total REAL NOT NULL DEFAULT 0, metodo_pago TEXT, direccion_entrega TEXT, estado TEXT NOT NULL DEFAULT 'Pendiente', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (cliente_id) REFERENCES clientes(id));
             CREATE TABLE IF NOT EXISTS detalle_pedido (id INTEGER PRIMARY KEY AUTOINCREMENT, pedido_id INTEGER NOT NULL, producto_id INTEGER NOT NULL, cantidad INTEGER NOT NULL CHECK(cantidad > 0), precio_unitario REAL NOT NULL, subtotal REAL NOT NULL, FOREIGN KEY (pedido_id) REFERENCES pedidos(id), FOREIGN KEY (producto_id) REFERENCES productos(id));
             CREATE TABLE IF NOT EXISTS mensajes (id INTEGER PRIMARY KEY AUTOINCREMENT, telefono TEXT, remitente TEXT NOT NULL CHECK(remitente IN ('usuario', 'bot', 'asesor')), contenido TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+            CREATE TABLE IF NOT EXISTS cola_mensajes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payload TEXT NOT NULL,
+                estado TEXT NOT NULL DEFAULT 'pendiente' CHECK(estado IN ('pendiente', 'procesando', 'procesado', 'error')),
+                intentos INTEGER NOT NULL DEFAULT 0,
+                ultimo_error TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS idx_cola_mensajes_estado ON cola_mensajes(estado, id);
         """)
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(productos)")}
         if "source_id" not in columns:
@@ -226,3 +236,76 @@ def set_repair_quote(code, amount, observations, decision=None):
         ).rowcount
     if not updated:
         raise ValueError("No existe una reparacion con ese codigo.")
+
+
+# --- Cola de mensajes entrantes de WhatsApp ---------------------------------
+#
+# Cola "tonta": guarda el payload crudo del webhook de Meta tal cual llega,
+# sin interpretarlo. Quien decide qué significa el mensaje (wa_id, texto,
+# tipo) es el worker al momento de procesar, no esta capa. Así, un cambio
+# futuro en cómo se interpreta un mensaje nunca deja datos ya parseados e
+# inconsistentes guardados en la cola, y el payload original queda completo
+# para depurar si algo falla.
+#
+# Persistida en SQLite (no en memoria) para que ningún mensaje se pierda si
+# el proceso se reinicia o se cae a mitad de procesar uno.
+
+MAX_INTENTOS_COLA = 5
+
+
+def enqueue_message(payload):
+    """Guarda el payload crudo (string JSON) del webhook de Meta como
+    pendiente de procesar. Devuelve el id de la fila insertada."""
+    with get_connection() as connection:
+        cursor = connection.execute(
+            "INSERT INTO cola_mensajes (payload, estado) VALUES (?, 'pendiente')",
+            (payload,),
+        )
+        return cursor.lastrowid
+
+
+def claim_next_pending_message():
+    """Toma el mensaje pendiente más antiguo y lo marca 'procesando' de forma
+    atómica, para que dos workers no puedan tomar el mismo mensaje a la vez.
+    Devuelve la fila (con su payload) o None si no hay nada pendiente."""
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT id, payload, intentos FROM cola_mensajes "
+            "WHERE estado='pendiente' ORDER BY id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        updated = connection.execute(
+            "UPDATE cola_mensajes SET estado='procesando', updated_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND estado='pendiente'",
+            (row["id"],),
+        ).rowcount
+        if updated != 1:
+            # Otro worker se lo llevó primero entre el SELECT y el UPDATE.
+            return None
+        return row
+
+
+def mark_message_processed(message_id):
+    with get_connection() as connection:
+        connection.execute(
+            "UPDATE cola_mensajes SET estado='procesado', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (message_id,),
+        )
+
+
+def mark_message_error(message_id, error_text):
+    """Registra el fallo. Si aún no se alcanzó MAX_INTENTOS_COLA, vuelve a
+    'pendiente' para que el worker lo reintente más adelante; si ya se
+    agotaron los intentos, queda en 'error' definitivo."""
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT intentos FROM cola_mensajes WHERE id=?", (message_id,)
+        ).fetchone()
+        intentos = (row["intentos"] if row else 0) + 1
+        siguiente_estado = "error" if intentos >= MAX_INTENTOS_COLA else "pendiente"
+        connection.execute(
+            "UPDATE cola_mensajes SET estado=?, intentos=?, ultimo_error=?, "
+            "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (siguiente_estado, intentos, str(error_text)[:2000], message_id),
+        )
