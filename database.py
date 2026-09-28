@@ -309,3 +309,15 @@ def mark_message_error(message_id, error_text):
             "updated_at=CURRENT_TIMESTAMP WHERE id=?",
             (siguiente_estado, intentos, str(error_text)[:2000], message_id),
         )
+
+
+def log_message(telefono, remitente, contenido):
+    """Registra un mensaje (entrante o saliente) en el log permanente de
+    conversación. A diferencia de cola_mensajes (que es efímera: se vacía a
+    medida que se procesa), esta tabla nunca se limpia — es el historial
+    completo definido en el punto 2.3 del diseño."""
+    with get_connection() as connection:
+        connection.execute(
+            "INSERT INTO mensajes (telefono, remitente, contenido) VALUES (?, ?, ?)",
+            (telefono, remitente, contenido),
+        )

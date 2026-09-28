@@ -1,58 +1,42 @@
+import json
 import os
-import secrets
-from datetime import timedelta
 
-from flask import Flask, jsonify, render_template, request, session
+from flask import Flask, Response, jsonify, request
 from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 
-from chatbot import process_message
-from database import initialize_database
+import whatsapp_client
+from database import enqueue_message, initialize_database
 from semantic_search import warmup
-
-
-MAX_MESSAGE_LENGTH = 1000  # el index.html ya limita a 500 en el input, esto es el candado real del servidor
 
 
 def create_app():
     app = Flask(__name__)
     app.config["JSON_AS_ASCII"] = False
 
-    # Límite duro de tamaño de request: sin esto, cualquiera puede mandar un
-    # body JSON gigante para agotar memoria/CPU antes de que se valide nada.
-    # 16 KB es de sobra para {"message": "..."} con un mensaje razonable.
-    app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+    # Límite duro de tamaño de request. Los payloads de WhatsApp para un
+    # mensaje de texto o una interacción de lista/botón son pequeños, pero
+    # dejamos margen razonable (64 KB) por la metadata que Meta agrega a
+    # cada evento del webhook.
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
-    # SECRET_KEY firma la cookie de sesión de Flask (itsdangerous). Debe
-    # definirse de forma estable vía variable de entorno en producción: si
-    # cambia (o se genera al azar en cada arranque, como aquí por defecto),
-    # todas las sesiones activas quedan invalidadas al reiniciar el proceso.
-    # Con múltiples workers (gunicorn -w N) TODOS deben compartir el mismo
-    # SECRET_KEY, o cada worker firmará con una clave distinta.
-    app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
-    app.config["SESSION_COOKIE_HTTPONLY"] = True  # JS del navegador no puede leer la cookie
-    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"  # mitiga CSRF básico
-    # Detrás de HTTPS en producción, exporta SESSION_COOKIE_SECURE=1 para que
-    # la cookie nunca viaje por HTTP sin cifrar.
-    app.config["SESSION_COOKIE_SECURE"] = os.environ.get("SESSION_COOKIE_SECURE") == "1"
-    app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
+    # Ya no hay sesión de navegador ni cookie que firmar: WhatsApp identifica
+    # al remitente por wa_id en cada mensaje, y ese wa_id viene dentro de un
+    # payload cuya firma se valida contra WHATSAPP_APP_SECRET (ver
+    # whatsapp_client.is_valid_signature). No aplica app.secret_key,
+    # SESSION_COOKIE_*, ni PERMANENT_SESSION_LIFETIME.
 
-    # Rate limiting por IP. storage_uri="memory://" es solo válido con UN
-    # proceso: si despliegas con varios workers (gunicorn -w N) o varias
-    # instancias, cada uno llevaría su propio contador y el límite real
-    # efectivo se multiplica. Para producción con más de un worker, usa
-    # Redis: storage_uri="redis://localhost:6379" (requiere `pip install
-    # flask-limiter[redis]` y un Redis corriendo).
+    # Rate limiting por wa_id (número del remitente), no por IP: todo el
+    # tráfico legítimo llega desde las IPs de Meta, así que limitar por IP
+    # ya no protege nada (por eso se retira get_remote_address). Esta capa
+    # es distinta de la validación de firma (que es autenticación): aquí se
+    # protege contra que un número específico sature el procesamiento,
+    # aunque sus mensajes sean legítimos.
     #
-    # get_remote_address lee request.remote_addr directamente. Si despliegas
-    # detrás de un reverse proxy (nginx, un load balancer, etc.), Flask verá
-    # la IP del proxy para todos los clientes a menos que instales
-    # werkzeug.middleware.proxy_fix.ProxyFix y confíes explícitamente en el
-    # proxy. NO actives eso sin un proxy real de por medio: si el proceso
-    # queda expuesto directo a internet y confías en X-Forwarded-For,
-    # cualquiera puede falsificar esa cabecera y saltarse el límite por IP.
+    # storage_uri="memory://" solo es válido con UN proceso, igual que en la
+    # versión web: con varios workers (gunicorn -w N) usar Redis
+    # (storage_uri="redis://localhost:6379").
     limiter = Limiter(
-        get_remote_address,
+        key_func=_rate_limit_key,
         app=app,
         storage_uri="memory://",
         default_limits=[],
@@ -61,46 +45,94 @@ def create_app():
     initialize_database()
 
     # Precarga el modelo de búsqueda semántica y los embeddings del catálogo
-    # ANTES de exponer la app al cliente, para que la primera petición real
-    # no pague el costo de esa carga inicial.
+    # ANTES de exponer el webhook, para que el primer mensaje real no pague
+    # el costo de esa carga inicial.
     warmup()
 
-    @app.get("/")
-    def index():
-        return render_template("index.html")
+    @app.get("/webhook")
+    def verify_webhook():
+        # Handshake de verificación que exige Meta al configurar (o
+        # re-verificar) el webhook. Queda siempre activo, no solo durante el
+        # setup inicial, por si Meta necesita re-verificar más adelante
+        # (ej. cambio de URL).
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
 
-    @app.post("/api/chat")
-    @limiter.limit("30 per minute; 8 per 10 seconds")
-    def chat():
-        data = request.get_json(silent=True) or {}
-        message = data.get("message", "")
-        if not isinstance(message, str) or not message.strip():
-            return jsonify({"error": "Escribe un mensaje para continuar."}), 400
-        if len(message) > MAX_MESSAGE_LENGTH:
-            return jsonify({"error": "El mensaje es demasiado largo."}), 400
+        try:
+            result = whatsapp_client.verify_webhook_challenge(mode, token, challenge)
+        except whatsapp_client.WhatsAppConfigError:
+            # Falta configurar WHATSAPP_VERIFY_TOKEN en el entorno: no es
+            # culpa de quien llama, pero tampoco se revela el motivo exacto.
+            return Response(status=403)
 
-        # El session_id ya NO se acepta del cliente: antes cualquiera podía
-        # enviar el session_id de otra persona y heredar su carrito o su
-        # flujo de compra en curso. Ahora el servidor emite y firma el
-        # identificador dentro de una cookie httponly; el cliente no puede
-        # leerlo ni falsificarlo.
-        session_id = session.get("sid")
-        if not session_id:
-            session_id = secrets.token_urlsafe(32)
-            session["sid"] = session_id
-            session.permanent = True
+        if result is None:
+            return Response(status=403)
+        return Response(result, status=200, mimetype="text/plain")
 
-        return jsonify(process_message(message, session_id))
+    @app.post("/webhook")
+    @limiter.limit("20 per minute")
+    def receive_webhook():
+        # La firma se valida sobre los BYTES CRUDOS del body, antes de que
+        # Flask reinterprete nada como JSON. Si no coincide, no se procesa
+        # ni se loggea el contenido del mensaje: solo se rechaza.
+        raw_body = request.get_data()
+        signature = request.headers.get("X-Hub-Signature-256")
+
+        try:
+            valid = whatsapp_client.is_valid_signature(raw_body, signature)
+        except whatsapp_client.WhatsAppConfigError:
+            return Response(status=403)
+
+        if not valid:
+            return Response(status=403)
+
+        # La cola guarda el payload crudo tal cual llega (ver database.py):
+        # esta capa no decide qué significa el mensaje, solo lo persiste
+        # para que el worker lo procese aparte. Esto es lo que permite
+        # responder 200 a Meta de inmediato y evitar reintentos/duplicados
+        # por timeout.
+        try:
+            payload_text = raw_body.decode("utf-8")
+            json.loads(payload_text)  # valida que sea JSON antes de encolar
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # Body inválido pese a traer firma correcta: no hay nada
+            # procesable que encolar, pero tampoco es un fallo del cliente
+            # (Meta) en sí. Se responde 200 igual para no generar
+            # reintentos infinitos de un payload que nunca será válido.
+            return Response(status=200)
+
+        enqueue_message(payload_text)
+        return Response(status=200)
 
     @app.errorhandler(413)
     def payload_too_large(error):
-        return jsonify({"error": "El mensaje enviado es demasiado grande."}), 413
+        return jsonify({"error": "Payload demasiado grande."}), 413
 
     @app.errorhandler(429)
     def rate_limited(error):
-        return jsonify({"error": "Demasiados mensajes seguidos. Espera un momento e intenta de nuevo."}), 429
+        # Nunca se expone que existe un rate limiter ni el motivo exacto.
+        # Se responde 200 (no 500, no un error visible) para no generar
+        # reintentos de Meta ni exponer detalles internos; el límite es
+        # generoso para una conversación humana normal.
+        return Response(status=200)
 
     return app
+
+
+def _rate_limit_key():
+    """Clave de rate limiting: el wa_id del remitente, extraído del cuerpo
+    del webhook. Si el payload no trae un wa_id identificable (formato
+    inesperado, evento de status en vez de mensaje, etc.), se usa un cubo
+    compartido "desconocido" en vez de fallar — nunca debe tumbar el
+    request por esto; en el peor caso ese cubo se satura entre varios
+    remitentes no identificados, lo cual es una degradación aceptable.
+    """
+    payload = request.get_json(silent=True) or {}
+    extracted = whatsapp_client.extract_incoming_message(payload)
+    if extracted and extracted.get("wa_id"):
+        return extracted["wa_id"]
+    return "desconocido"
 
 
 app = create_app()

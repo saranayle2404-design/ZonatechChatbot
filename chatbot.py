@@ -13,6 +13,19 @@ from semantic_search import semantic_product_matches
 SESSIONS = {}
 PAGE_SIZE = 5
 
+# Punto 2.3 del diseno de migracion a WhatsApp: el LOG de mensajes es
+# permanente (tabla mensajes en database.py) y los datos de negocio
+# (clientes/pedidos/reparaciones) tambien lo son, pero el FLUJO de
+# conversacion en curso (carrito, registro de reparacion a medias,
+# contexto conversacional) debe caducar tras inactividad: sin esto, un
+# cliente que retoma la conversacion semanas despues heredaria un carrito
+# o un flujo de compra con precios/stock que ya cambiaron. SESSIONS sigue
+# siendo en memoria del proceso worker (se pierde si el worker se
+# reinicia, igual que ya ocurria en la version web con la cookie de
+# sesion): eso es aceptable porque nada de negocio vive aqui, solo el
+# progreso de la conversacion activa.
+SESSION_INACTIVITY_TIMEOUT = timedelta(minutes=45)
+
 # El código de reparación es secuencial y predecible (ZT-R-YYYYMMDD-0001), y
 # el teléfono no es un secreto fuerte, así que "código + teléfono" por sí solo
 # es una credencial débil. Sin límite de intentos, alguien con el teléfono de
@@ -144,12 +157,32 @@ def response(text, quick_replies=None):
     return {"reply": text, "quick_replies": quick_replies or []}
 
 
-def session_for(session_id):
-    return SESSIONS.setdefault(session_id, {
+def _fresh_session():
+    return {
         "cart": [], "flow": None, "data": {}, "last_search": {}, "last_results": [],
         "last_selected_id": None, "conversation": {},
         "repair_lookup": {"failed_attempts": 0, "locked_until": None},
-    })
+        "last_active": datetime.now(),
+    }
+
+
+def session_for(session_id):
+    """Devuelve el estado de flujo para este remitente, reiniciandolo si
+    paso mas de SESSION_INACTIVITY_TIMEOUT desde el ultimo mensaje (punto
+    2.3). "repair_lookup" (el bloqueo de seguridad contra fuerza bruta de
+    codigos de reparacion) es la unica excepcion: se preserva aunque el
+    flujo expire, porque es un control de seguridad, no progreso de
+    conversacion, y expirarlo abriria una forma de saltarselo esperando.
+    """
+    now = datetime.now()
+    session = SESSIONS.setdefault(session_id, _fresh_session())
+    if now - session.get("last_active", now) > SESSION_INACTIVITY_TIMEOUT:
+        repair_lookup = session.get("repair_lookup", {"failed_attempts": 0, "locked_until": None})
+        session.clear()
+        session.update(_fresh_session())
+        session["repair_lookup"] = repair_lookup
+    session["last_active"] = now
+    return session
 
 
 def repair_lookup_locked(session):
