@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import secrets
 from datetime import datetime
@@ -35,7 +36,20 @@ def initialize_database():
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                session_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                last_active TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS repair_lockouts (
+                session_id TEXT PRIMARY KEY,
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                locked_until TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE INDEX IF NOT EXISTS idx_cola_mensajes_estado ON cola_mensajes(estado, id);
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_last_active ON chat_sessions(last_active);
         """)
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(productos)")}
         if "source_id" not in columns:
@@ -91,6 +105,62 @@ def search_products(query="", category=None, max_price=None, available_only=Fals
 def get_product(product_id):
     with get_connection() as connection:
         return connection.execute("SELECT * FROM productos WHERE id=? AND activo=1", (product_id,)).fetchone()
+
+
+def load_session_state(session_id):
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT state_json FROM chat_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["state_json"])
+
+
+def save_session_state(session_id, session_state):
+    payload = json.dumps(session_state, default=str)
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO chat_sessions (session_id, state_json, last_active, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(session_id) DO UPDATE SET
+                state_json = excluded.state_json,
+                last_active = excluded.last_active,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (session_id, payload, datetime.now().isoformat()),
+        )
+
+
+def load_repair_lockout(session_id):
+    with get_connection() as connection:
+        row = connection.execute(
+            "SELECT failed_attempts, locked_until FROM repair_lockouts WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return {"failed_attempts": 0, "locked_until": None}
+        return {
+            "failed_attempts": row["failed_attempts"],
+            "locked_until": row["locked_until"],
+        }
+
+
+def save_repair_lockout(session_id, state):
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO repair_lockouts (session_id, failed_attempts, locked_until, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(session_id) DO UPDATE SET
+                failed_attempts = excluded.failed_attempts,
+                locked_until = excluded.locked_until,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (session_id, state.get("failed_attempts", 0), state.get("locked_until")),
+        )
 
 
 def create_order(customer, cart, address, payment_method):

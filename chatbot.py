@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 
 from database import (
     create_order, create_repair, get_product, get_repair_by_code_and_phone,
-    list_categories, search_products,
+    list_categories, load_repair_lockout, load_session_state, save_repair_lockout,
+    save_session_state, search_products,
 )
 from semantic_search import semantic_product_matches
 
@@ -166,22 +167,48 @@ def _fresh_session():
     }
 
 
+def _restore_datetime_fields(session):
+    if session is None:
+        return None
+    if isinstance(session.get("last_active"), str):
+        session["last_active"] = datetime.fromisoformat(session["last_active"])
+    repair_lookup = session.get("repair_lookup", {"failed_attempts": 0, "locked_until": None})
+    if isinstance(repair_lookup.get("locked_until"), str):
+        repair_lookup["locked_until"] = datetime.fromisoformat(repair_lookup["locked_until"])
+    session["repair_lookup"] = repair_lookup
+    return session
+
+
 def session_for(session_id):
-    """Devuelve el estado de flujo para este remitente, reiniciandolo si
-    paso mas de SESSION_INACTIVITY_TIMEOUT desde el ultimo mensaje (punto
-    2.3). "repair_lookup" (el bloqueo de seguridad contra fuerza bruta de
-    codigos de reparacion) es la unica excepcion: se preserva aunque el
-    flujo expire, porque es un control de seguridad, no progreso de
-    conversacion, y expirarlo abriria una forma de saltarselo esperando.
+    """Devuelve el estado de flujo para este remitente, persistido en SQLite
+    para que sobreviva reinicios del worker y de la app de Meta.
+
+    La sesión viva en memoria solo actúa como caché de trabajo; la fuente de
+    verdad es la base de datos del bot, porque WhatsApp es un canal
+    stateless: cada mensaje llega por separado y el `wa_id` identifica al
+    usuario, no a una sesión de navegador/autenticación.
     """
     now = datetime.now()
-    session = SESSIONS.setdefault(session_id, _fresh_session())
+    session = SESSIONS.get(session_id)
+    if session is None:
+        session = _restore_datetime_fields(load_session_state(session_id))
+        if session is None:
+            session = _fresh_session()
+        repair_lookup = load_repair_lockout(session_id)
+        if isinstance(repair_lookup.get("locked_until"), str):
+            repair_lookup["locked_until"] = datetime.fromisoformat(repair_lookup["locked_until"])
+        session.setdefault("repair_lookup", {}).update(repair_lookup)
+        SESSIONS[session_id] = session
+
     if now - session.get("last_active", now) > SESSION_INACTIVITY_TIMEOUT:
         repair_lookup = session.get("repair_lookup", {"failed_attempts": 0, "locked_until": None})
         session.clear()
         session.update(_fresh_session())
         session["repair_lookup"] = repair_lookup
+
+    session["_session_id"] = session_id
     session["last_active"] = now
+    save_session_state(session_id, session)
     return session
 
 
@@ -198,11 +225,14 @@ def register_repair_lookup_result(session, found):
     if found:
         state["failed_attempts"] = 0
         state["locked_until"] = None
-        return
-    state["failed_attempts"] += 1
-    if state["failed_attempts"] >= REPAIR_LOOKUP_MAX_ATTEMPTS:
-        state["locked_until"] = datetime.now() + REPAIR_LOOKUP_LOCKOUT
-        state["failed_attempts"] = 0
+    else:
+        state["failed_attempts"] += 1
+        if state["failed_attempts"] >= REPAIR_LOOKUP_MAX_ATTEMPTS:
+            state["locked_until"] = datetime.now() + REPAIR_LOOKUP_LOCKOUT
+            state["failed_attempts"] = 0
+    session_id = session.get("_session_id")
+    if session_id:
+        save_repair_lockout(session_id, state)
 
 
 def conversation_for(session):
