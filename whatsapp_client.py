@@ -18,6 +18,11 @@ import json
 import os
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 COUNTRY_CODE = "57"  # Colombia. Si algún día la tienda opera en más países,
                       # esta es la única constante que dejaría de ser válida.
