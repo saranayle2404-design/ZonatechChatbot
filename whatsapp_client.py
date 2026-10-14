@@ -26,7 +26,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 COUNTRY_CODE = "57"  # Colombia. Si algún día la tienda opera en más países,
                       # esta es la única constante que dejaría de ser válida.
-GRAPH_API_VERSION = "v21.0"
+GRAPH_API_VERSION = "v26.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 
